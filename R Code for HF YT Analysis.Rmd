@@ -1,0 +1,596 @@
+---
+title: "Hessian Fly Yield Trial Analysis"
+author: "Zachary Winn"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(formatR)
+knitr::opts_chunk$set(echo = TRUE, tidy = TRUE, tidy.opts = list(width.cutoff=3000), fig.width = 16, fig.height = 12)
+library(ggplot2)
+ggplot2::theme_set(theme_bw())
+ggplot2::theme_update(text=element_text(size=18))
+options(width = 10000)
+```
+
+# Introduction
+
+Here is all the code that was used in the present study. PIT and NOPPT are not normal. They are zero-inflated, continuous, positive non-integers. There are no available models which can handle this data in a way that is amenable to contrast in lme4. Therefore, I am going to apply a Inverse hyperbolic sine (IHS) transformation. The transformation is defined below:
+
+$$
+f(y,\theta)=\frac{sinh^{-1}(\theta y)}{\theta}=log(\theta y+(\theta^{2} y^{2}+1)^\frac{1}{2})
+$$
+Where y is a response of any distribution and theta is a value which results in the best fit of the response to a normal distribution. $\theta$ may be estimated empirically. This may be done by using the log-likelihood to best estimate which value of theta results in the best fit of the data. This can be expressed as in Burbidge et al (1988) (https://doi.org/10.2307/2288929).
+
+$$
+-\frac{1}{2}\sum log(1+\theta^2y^2_i)
+$$
+Where $\theta$ is any value of $\theta\ge0$ and $y_i$ is the $i^{th}$ observation of response y. Essentially, many values of $\theta$ are considered, and the one which maximizes the log-likelihood is used as $\theta$ in the previous transformation.
+
+# Reading in the Data
+
+Here I read in the data and tranform the data
+
+```{r, warning=FALSE, echo=FALSE, include=FALSE}
+#remove previous list
+remove(list = ls())
+
+#reset working directory to current folder
+setwd(paste("C:/Users/", 
+            Sys.getenv("USERNAME"),
+            "/OneDrive/Publication/Manuscripts In Progress/Hessian Fly Yield/Analysis", sep = ""))
+
+#pull in phenotype data
+pheno<-read.csv("Combined HF YT Data.csv")
+
+#library
+library(tidyverse)
+
+#pull relevant information
+pheno<-pheno %>%
+  dplyr::select(Location,
+         Rep,
+         Treatment,
+         Genotype,
+         PIT,
+         NOPPT,
+         Yield_Mt_Ha,
+         TW) %>%
+  rename(`Grain Yield`=Yield_Mt_Ha)
+
+#create functions for IHS
+IHS.loglik<-function(theta, x){
+
+  n<-length(x) #number of observations in the vector
+  xt<-asinh(theta*x)/theta #this contains the transformed vector 
+
+  log.lik<-(-n)*log(sum((xt - mean(xt))^2))- sum(log(1+theta^2*x^2)) #this is the summation of the vector
+  return(log.lik) #this is the log-likelihood
+  
+}     
+
+#function to IHS transform
+IHS<-function(theta, x){  
+  asinh(theta * x)/theta
+}
+
+#this is the inverse of the transformation above
+IHS_BT<-function(theta, x){
+  sinh(theta*x)/theta 
+}
+
+#pull vectors for traits to be transformed
+PIT_v=pheno[,"PIT"]
+PIT_v=PIT_v[!is.na(PIT_v)]
+NOPPT_v=pheno[,"NOPPT"]
+NOPPT_v=NOPPT_v[!is.na(NOPPT_v)]
+
+#select optimum theta based on log-likelihood 
+theta_PIT<-optimise(IHS.loglik, lower=0, upper=200, x=PIT_v, maximum=TRUE)$maximum #look at all possible theta from 0 to 1000
+theta_NOPPT<-optimise(IHS.loglik, lower=0, upper=200, x=NOPPT_v, maximum=TRUE)$maximum
+
+#transform
+pheno<-pheno %>%
+  mutate(PIT_T=IHS(theta = theta_PIT, x = PIT),
+         NOPPT_T=IHS(theta = theta_NOPPT, x = NOPPT))
+```
+```{r,echo=FALSE}
+#library
+library(psych)
+
+#Figure 1
+a<-pheno %>% dplyr::select(PIT_T, NOPPT_T, `Grain Yield`)
+colnames(a)<-c("Percent Infested Tillers (Transformed)",
+               "Number of Larvae/Pupae per Tiller (Transformed)",
+               "Grain Yield")
+
+png(filename = "Sup Figure 1.png",
+    width = 750,
+    height = 750)
+
+pairs.panels(a,
+             lm=TRUE,
+             ellipses = FALSE,
+             digits = 2,
+             stars = TRUE,
+             hist.col = "gray")
+
+dev.off()
+
+pairs.panels(a,
+             lm=TRUE,
+             ellipses = FALSE,
+             digits = 2,
+             stars = TRUE,
+             hist.col = "gray")
+
+
+a<-pheno %>% dplyr::select(PIT, NOPPT, `Grain Yield`)
+
+pairs.panels(a,
+             lm=TRUE,
+             ellipses = FALSE,
+             digits = 2,
+             stars = TRUE,
+             hist.col = "gray")
+```
+
+# Running Single Environment Models
+
+Here I run the following split-plot mixed linear model:
+
+$$
+y_{ijk}=\mu+G_i+gr_{ik}+T_j+tr_{jk}+GT_{ij}+\varepsilon_{ijk}
+$$
+
+Where y is the response, G is the fixed genotype effect, gr is the genotype by rep interaction (whole-plot error, IID), T is the fixed treatment effect, tr is the random treatment by rep interaction (sub-plot error, IID), GT is the fixed genotype by treatment interaction, and $\varepsilon$ is the residual error which is IID. 
+
+```{r}
+#set up models
+traits<-c("PIT_T", 
+          "NOPPT_T", 
+          "Grain Yield")
+env<-c(unique(pheno$Location))
+preds<-pheno %>% 
+  dplyr::select(Genotype, Treatment) %>% 
+  distinct()
+
+#library
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(knitr)
+library(multcomp)
+
+#make an empty frame for results
+anova_results<-c()
+g_by_t_means<-c()
+g_by_t_contrast<-c()
+
+#display G*E graphs?
+vis_on=0
+
+#Run Models
+for (i in traits){
+  for (j in env){
+    
+    #pull data for location and trait
+    loc<-pheno[pheno$Location==j,]
+    loc<-loc %>% dplyr::select(Rep, Genotype, Treatment, all_of(i))
+    colnames(loc)[4]="Y"
+    
+    if (sum(is.na(loc[,"Y"]))==nrow(loc)){ #check if data was taken
+      
+      #print if there is no data
+      print(paste("**** No data was taken for", i, "in", j, "****"))
+      
+    }else{
+      
+      #print to announce
+      print(paste("*** Running model for", i, "in" , j, "***", sep = " "))
+
+      #run mixed linear model
+      mlm<-lmer(Y~Genotype+
+                  Treatment+
+                  Genotype:Treatment+
+                  (1|Rep),
+              data=loc)
+      
+      #print ANOVA and summary of model
+      print("*** Showing ANOVA Table ***")
+      print(anova(mlm))
+      #print("*** Showing Summary ***")
+      #print(summary(mlm))
+      print("*** Showing Random Effect Estimates ***")
+      print(ranef(mlm))
+      
+      
+      #pull G-by-E estimates
+      a<-summary(emmeans(mlm, ~Genotype:Treatment, type="response"))
+      a<-a %>% 
+        mutate(Location=all_of(j),
+               Trait=all_of(i)) %>%
+        rename(Estimate=emmean,
+               DF=df,
+               `Lower Confidence Level`=lower.CL,
+               `Upper Confidence Level`=upper.CL) %>%
+        dplyr::select(Genotype,
+               Treatment,
+               Trait, 
+               Location, 
+               Estimate, 
+               DF, 
+               `Lower Confidence Level`, 
+               `Upper Confidence Level`)
+      
+      #bind in G-by-E estimates
+      g_by_t_means<-rbind(g_by_t_means,a)
+      
+      #print means
+      a<-a[order(a$Genotype),]
+      print(kable(a, caption = paste("Means with confidence intervals of Genotype*Treatment interaction for", i, "in", j), row.names = F, digits = 2))
+      
+      #preform pairwise contrast
+      a<-emmeans(mlm, ~ Genotype:Treatment)
+      a<-summary(contrast(a, method = "pairwise"))
+      a<-a %>%
+        separate(contrast, into = c("Combination_1", "Combination_2"), sep = " - ") %>%
+        filter(Combination_1=="Jamestown Absent" & Combination_2=="Jamestown Present"|
+                 Combination_1=="LA03136E71 Absent" & Combination_2=="LA03136E71 Present"|
+                 Combination_1=="(NC11546-14 Absent)" & Combination_2=="(NC11546-14 Present)"|
+                 Combination_1=="Shirley Absent" & Combination_2=="Shirley Present"|
+                 Combination_1=="SS8641 Absent" & Combination_2=="SS8641 Present"|
+                 Combination_1=="USG3404 Absent" & Combination_2=="USG3404 Present")
+      
+      #print results and bind in
+      a$trait=i
+      a$location=j
+      a<-a %>%
+        dplyr::select(Combination_1,
+               Combination_2,
+               trait,
+               location,
+               estimate,
+               SE,
+               df,
+               t.ratio,
+               p.value) %>%
+        rename(`Combination 1`=Combination_1,
+               `Combination 2`=Combination_2,
+               Trait=trait,
+               Location=location,
+               Estimate=estimate,
+               SE=SE,
+               DF=df,
+               `T-Ratio`=t.ratio,
+               `P(>T)`=p.value)
+      
+      print(kable(a, caption = paste("Pairwise contrast for Genotype*Treatment for", i, "in", j), digits = 2))
+      g_by_t_contrast<-rbind(g_by_t_contrast, a)
+      
+      
+      if(vis_on==1){
+        
+        #display G*E Graph
+        a<-summary(emmeans(mlm, ~Genotype:Treatment))
+        a<-ggplot(data=a, aes(x=Treatment, y=emmean, color=Genotype))+
+          geom_point()+
+          geom_line(aes(group=Genotype))+
+          labs(title=paste("Genotype*Treatment Interaction Plot for", i, "in", j),
+               y="")
+        print(a)
+        
+        #pull ANOVA table results
+        a<-anova(mlm)
+        a<-data.frame(Effect=row.names(a),
+                      Location=j,
+                      Trait=i,
+                      `F Value`=a$`F value`,
+                      `P(>F)`=a$`Pr(>F)`,
+                      check.names= F)
+        a<-a %>%
+          dplyr::select(Location,
+                 Trait,
+                 Effect,
+                 `F Value`,
+                 `P(>F)`)
+        anova_results<-rbind(anova_results,a)
+        
+        #print
+        print("*** Analysis finsihed - moving on to next trait ***")
+        print("")
+        print("")
+        
+      }else{
+        
+        #pull ANOVA table results
+        a<-anova(mlm)
+        a<-data.frame(Effect=row.names(a),
+                      Location=j,
+                      Trait=i,
+                      `F Value`=a$`F value`,
+                      `P(>F)`=a$`Pr(>F)`,
+                      check.names= F)
+        a<-a %>%
+          dplyr::select(Location,
+                 Trait,
+                 Effect,
+                 `F Value`,
+                 `P(>F)`)
+        anova_results<-rbind(anova_results,a)
+
+        #print
+        print("*** Analysis finsihed - moving on to next trait ***")
+        print("")
+        print("")
+                
+      }
+    } 
+  }
+}
+
+#write out results
+write.csv(anova_results,
+          "single_environment_anova_results.csv",
+          row.names = F)
+
+write.csv(g_by_t_means,
+          "g_by_t_single_environment_means.csv",
+          row.names = F)
+
+write.csv(g_by_t_contrast,
+          "g_by_t_single_environment_contrast.csv",
+          row.names = F)
+```
+
+## Across Environments
+
+Here I run an across environments analysis with the following model:  
+
+$$
+y_{ijkl}=\mu+G_i+T_j+E_k+GT_{ij}+GE_{ik}+ET_{jk}+GTE_{ijk}+e(r)_{kl}+\varepsilon_{ijkl} 
+$$
+
+where y is the response, G is the fixed genotype effect, T is the fixed treatment effect, E is the fixed environment effect (year+location), GT is the fixed genotype by treatment effect, GE is the fixed genotype by environment effect, ET is the fixed environment by treatment effect, te(r) is the random treatment by rep nested in environment interaction, and GTE is the fixed genotype by treatment by environment effect, e(r) is the rep within environment random effect (IID), and $\varepsilon$ is the residual error that is IID.
+
+```{r, echo=FALSE}
+#pull traits
+traits<-c("PIT_T", "NOPPT_T", "Grain Yield")
+
+#make an empty frame for results
+anova_results<-data.frame(Effect=c("Genotype",
+                                   "Treatment",
+                                   "Environment",
+                                   "Genotype:Treatment",
+                                   "Genotype:Environment",
+                                   "Treatment:Environment",
+                                   "Genotype:Treatment:Environment"))
+g_by_t_means<-pheno %>%
+  distinct(Genotype,Treatment) %>%
+  dplyr::select(Genotype, Treatment)
+
+g_by_t_contrast<-data.frame(Combination_1=c("Jamestown Absent",
+                                            "LA03136E71 Absent",
+                                            "(NC11546-14 Absent)",
+                                            "Shirley Absent",
+                                            "SS8641 Absent",
+                                            "USG3404 Absent"),
+                            Combination_2=c("Jamestown Present",
+                                            "LA03136E71 Present",
+                                            "(NC11546-14 Present)",
+                                            "Shirley Present",
+                                            "SS8641 Present",
+                                            "USG3404 Present"),
+                            check.names = F)
+
+#new pheno
+#pheno<-pheno %>% filter(!Location=="CUN22")
+
+#do the analysis
+for(i in traits){
+  
+  #announce
+  print(paste("Analyzing", i))
+  
+  #pull data
+  a<-pheno %>% dplyr::select(1:4, all_of(i)) %>% drop_na()
+  a<-as.data.frame(a)
+  a[,1:4]<-lapply(a[,1:4], as.factor)
+  colnames(a)[1]="Environment"
+  colnames(a)[5]="Y"
+       
+  #Run model
+  mlm<-lmer(Y~Genotype+
+              Treatment+
+              Environment+
+              Genotype:Treatment+
+              Genotype:Environment+
+              Treatment:Environment+
+              Genotype:Treatment:Environment+
+              (1|Environment:Rep),
+             data=a)
+
+  #show ANOVA and Summary
+  print("*** Showing ANOVA Table ***")
+  print(anova(mlm))
+  #print("*** Showing Summary ***")
+  #print(summary(mlm))
+  print("*** Showing Random Effect Estimates ***")
+  print(ranef(mlm))
+  
+  
+  #pull ANOVA table summary
+  a<-anova(mlm)
+  a<-data.frame(Effect=row.names(a),
+                a=a$`F value`,
+                b=a$`Pr(>F)`)
+  colnames(a)[2:3]=c(paste("F Value", i, sep = " "), paste("P(>F)", i, sep = " "))
+  anova_results<-left_join(anova_results,a,by="Effect")
+  
+  
+  #pull Genotype:Treatment interaction and bind in
+  a<-summary(emmeans(mlm, ~Genotype:Treatment))
+  b<-a %>% dplyr::select(Genotype, Treatment, emmean, SE)
+  colnames(b)[3:4]<-c(paste(i,sep="_"), paste(i,"SE",sep="_"))
+  g_by_t_means<-left_join(g_by_t_means, b, by=c("Genotype", "Treatment"))
+  a<-a[order(a$Genotype),]
+  print(kable(a, caption = paste("Means with confidence intervals of Genotype*Treatment interaction for", i), row.names = F, digits = 2))
+  
+  #pull Genotype:Treatment contrast and bind in
+  a<-emmeans(mlm, ~ Genotype:Treatment)
+  a<-summary(contrast(a, method = "pairwise"))
+  a<-a %>%
+    separate(contrast, into = c("Combination_1", "Combination_2"), sep = " - ") %>%
+    filter(Combination_1=="Jamestown Absent" & Combination_2=="Jamestown Present"|
+             Combination_1=="LA03136E71 Absent" & Combination_2=="LA03136E71 Present"|
+             Combination_1=="(NC11546-14 Absent)" & Combination_2=="(NC11546-14 Present)"|
+             Combination_1=="Shirley Absent" & Combination_2=="Shirley Present"|
+             Combination_1=="SS8641 Absent" & Combination_2=="SS8641 Present"|
+             Combination_1=="USG3404 Absent" & Combination_2=="USG3404 Present")
+  print(kable(a, caption = paste("Pairwise contrast for Genotype*Treatment for", i), digits = 2))
+  a<-a %>% 
+    dplyr::select(Combination_1,
+           Combination_2,
+           estimate,
+           p.value)
+  colnames(a)[3:4]=c(paste(i,"Estimate",sep = " "),
+                     paste(i, "P(>F)", sep = " "))
+  g_by_t_contrast<-left_join(g_by_t_contrast,a,by=c("Combination_1", "Combination_2"))
+}
+
+#write out results
+write.csv(anova_results,
+          "multi_environment_anova_results.csv",
+          row.names = F)
+
+#Back transform estimates
+g_by_t_means<-g_by_t_means %>%
+  mutate(PIT_BT=IHS_BT(theta = theta_PIT, x = PIT_T)) %>%
+  mutate(NOPPT_BT=IHS_BT(theta = theta_NOPPT, x = NOPPT_T)) %>%
+  dplyr::select(Genotype,
+         Treatment,
+         PIT_BT,
+         PIT_T,
+         PIT_T_SE,
+         NOPPT_BT,
+         NOPPT_T,
+         NOPPT_T_SE,
+         `Grain Yield`,
+         `Grain Yield_SE`) %>%
+  arrange(Genotype, Treatment)
+
+#g_by_t_contrast<-g_by_t_contrast %>%
+#  mutate(`PIT_BT Estimate`=IHS_BT(theta = theta_PIT, x = `PIT_T Estimate`)) %>%
+#  mutate(`NOPPT_BT Estimate`=IHS_BT(theta = theta_NOPPT, x = `NOPPT_T Estimate`)) %>%
+#  dplyr::select(Combination_1,
+#         Combination_2,
+#         `PIT_BT Estimate`,
+#         `PIT_T Estimate`,
+#         `PIT_T P(>F)`,
+#         `NOPPT_BT Estimate`,
+#         `NOPPT_T Estimate`,
+#         `NOPPT_T P(>F)`,
+#         ``Grain Yield` Estimate`,
+#         ``Grain Yield` P(>F)`,
+#         `TW Estimate`,
+#         `TW P(>F)`)
+
+write.csv(g_by_t_means,
+          "g_by_t_multi_environment_means.csv",
+          row.names = F)
+
+write.csv(g_by_t_contrast,
+          "g_by_t_multi_environment_contrast.csv",
+          row.names = F)
+
+  
+for(i in traits){
+  
+  #pull data
+  a<-pheno %>% dplyr::select(1:4, all_of(i)) %>% drop_na()
+  a<-as.data.frame(a)
+  a[,1:4]<-lapply(a[,1:4], as.factor)
+  colnames(a)[1]="Environment"
+  colnames(a)[5]="Y"
+       
+  #Run model
+  mlm<-lmer(Y~Environment+
+              Treatment+
+              Genotype+
+              Genotype:Treatment+
+              Genotype:Environment+
+              Treatment:Environment+
+              Genotype:Treatment:Environment+
+              (1|Environment:Rep),
+             data=a)
+  
+  #create new name
+  zzz=ifelse(i=="Grain Yield", "Grain Yield (Metic Tons Per Hectare)",
+             ifelse(i=="TW", "Test Weight", 
+                    ifelse(i=="PIT_T", "Percent Infested Tillers (Transformed)",
+                           ifelse(i=="NOPPT_T", "Number of Larvae/Pupae Per Tiller (Transformed)"))))
+  
+  
+  #show pairwise contrasts
+  
+  #genotype by treatment
+  a<-emmeans(mlm, ~Treatment:Genotype)
+  a<-cld(a, alpha=0.05, Letters=LETTERS)
+  a$.group<-gsub(" ","",a$.group)
+  
+  b<-ggplot(data=a, aes(x=Treatment, y=emmean, fill=Treatment))+
+      geom_col(position = position_dodge(width = 1))+
+      facet_grid(~Genotype)+
+      geom_errorbar(data=a, aes(ymin=lower.CL, ymax=upper.CL), position = position_dodge(width = 1))+
+      geom_text(aes(label = .group, y = upper.CL), vjust = -0.5, position = position_dodge(width = 1))+
+      labs(title=paste("Genotype-by-Treatment Interaction Plot for", zzz),
+           y=zzz)+
+      theme(axis.text.x = element_text(angle = 90))
+  print(b)
+  
+  #environment by treatment
+  a<-emmeans(mlm, ~Environment:Treatment)
+  a<-cld(a, alpha=0.05, Letters=LETTERS)
+  a$.group<-gsub(" ","",a$.group)
+  
+  b<-ggplot(data=a, aes(x=Treatment, y=emmean, fill=Treatment))+
+      geom_col(position = position_dodge(width = 1))+
+      facet_grid(~Environment)+
+      geom_errorbar(data=a, aes(ymin=lower.CL, ymax=upper.CL), position = position_dodge(width = 1))+
+      geom_text(aes(label = .group, y = upper.CL), vjust = -0.5, position = position_dodge(width = 1))+
+      labs(title=paste("Treatment-by-Environment Interaction Plot for", zzz),
+           y=zzz)+
+      theme(axis.text.x = element_text(angle = 90))
+  print(b)
+  
+  #environment by genotype
+  a<-emmeans(mlm, ~Environment:Genotype)
+  a<-cld(a, alpha=0.05, Letters=LETTERS)
+  a$.group<-gsub(" ","",a$.group)
+  
+  b<-ggplot(data=a, aes(x=Environment, y=emmean, fill=Environment))+
+      geom_col(position = position_dodge(width = 1))+
+      facet_grid(~Genotype)+
+      geom_errorbar(data=a, aes(ymin=lower.CL, ymax=upper.CL), position = position_dodge(width = 1))+
+      geom_text(aes(label = .group, y = upper.CL), vjust = -0.5, position = position_dodge(width = 1))+
+      labs(title=paste("Genotype-by-Environment Interaction Plot for", zzz),
+           y=zzz)+
+      theme(axis.text.x = element_text(angle = 90))
+  print(b)
+  
+  #genotype*treatment*environment interaction
+  a<-summary(emmeans(mlm, specs = ~Genotype:Treatment:Environment))
+  
+  a<-ggplot(data = a, aes(x=Environment, y=emmean, color=Treatment, group=Treatment))+
+      geom_point(size=2)+
+      geom_line()+
+      geom_errorbar(aes(ymin=lower.CL, ymax=upper.CL))+
+      facet_wrap(facets = ~Genotype, ncol = 2)+
+      labs(title = paste("Genotype*Environment*Treatment Interaction Plot for", zzz),
+           y=zzz)+
+      theme(axis.text.x = element_text(angle = 90))
+  
+  print(a)
+}
+```
